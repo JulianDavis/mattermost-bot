@@ -1,50 +1,113 @@
 package main
 
 import (
-	"context"
+	"embed"
+	"encoding/json"
 	"fmt"
+	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 
-	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/JulianDavis/mattermost-bot/cmd/handlers"
+	"github.com/JulianDavis/mattermost-bot/cmd/mattermost"
+	"github.com/JulianDavis/mattermost-bot/cmd/post"
+	"github.com/go-co-op/gocron/v2"
 )
 
+type MattermostBot struct {
+	httpAddr  string
+	scheduler gocron.Scheduler
+	client    *mattermost.Mattermost
+}
+
+//go:embed templates
+var templatesFs embed.FS
+
+//go:embed templates/static
+var staticFiles embed.FS
+
 // Populated at build-time
-var token string
+var mmToken string
+
+// Temporarily hardcoded configuration values
+const mmDataFileName = "mattermost_bot.json"
+
+const mmServerScheme = "http"
+const mmServerIP = "127.0.0.1"
+const mmServerPort = 8065
+const mmTeamName = "test"
+
+const httpServerIp = "127.0.0.1"
+const httpServerPort = 8001
+
+/* TODO: Fix hardcoded args and paths
+ *       This file could probably just be opened at startup and held open, no one else should be reading or writing to it
+ *	     Eventually this should just be using SQLite or whatever
+ */
+func loadPostData() ([]post.Post, error) {
+	file, err := os.Open(mmDataFileName)
+	if err != nil {
+		fmt.Println("Failed to create static files:", err)
+		return []post.Post{}, err
+	}
+	defer file.Close()
+
+	var posts []post.Post
+	if err := json.NewDecoder(file).Decode(&posts); err != nil {
+		fmt.Println("Failed to create static files:", err)
+		return []post.Post{}, err
+	}
+
+	return posts, nil
+}
 
 func main() {
-	client := model.NewAPIv4Client("http://127.0.0.1:8065")
+	var err error
 
-	_, _, err := client.GetOldClientConfig(context.TODO(), "")
+	// Create bot
+	mmBot := MattermostBot{}
+	mmBot.httpAddr = fmt.Sprintf("%s:%d", httpServerIp, httpServerPort)
+
+	// Login to Mattermost
+	mmBot.client = mattermost.New(mmToken, mmTeamName)
+	mmServerURL := url.URL{
+		Scheme: mmServerScheme,
+		Host:   fmt.Sprintf("%s:%d", mmServerIP, mmServerPort),
+	}
+	mmBot.client.Login(mmServerURL)
+
+	// Create scheduler
+	mmBot.scheduler, err = gocron.NewScheduler()
 	if err != nil {
-		fmt.Println("Failed to get config:", err)
+		fmt.Println("Failed to create a new scheduler", err)
 		os.Exit(1)
 	}
-
-	client.SetToken(token)
-	user, _, err := client.GetMe(context.TODO(), "")
+	defer func() { _ = mmBot.scheduler.Shutdown() }()
+	posts, err := loadPostData()
 	if err != nil {
-		fmt.Println("Failed to log in:", err)
+		fmt.Println("Failed to load post data:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Logged in as %q with ID %q\n", user.Username, user.Id)
+	mmBot.client.SchedulePosts(mmBot.scheduler, posts)
+	mmBot.scheduler.Start()
 
-	channel, _, err := client.GetChannelByNameForTeamName(context.TODO(), "Announcements", "test", "")
+	// Start HTTP server
+	http.Handle("/", handlers.MainHandler{
+		TemplatesFs: templatesFs,
+	})
+	staticFs, err := fs.Sub(staticFiles, "templates/static")
 	if err != nil {
-		fmt.Println("Failed to get Announcements channel:", err)
+		fmt.Println("Failed to create static files:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Got Announcements channel ID: %q\n", channel.Id)
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFs))))
 
-	post := model.Post{
-		ChannelId: channel.Id,
-		Message:   "Hello, World!",
+	http.HandleFunc("/save", handlers.SaveHandler)
+	http.HandleFunc("/data", handlers.DataHandler)
+
+	fmt.Println("HTTP Server Started...")
+	if err := http.ListenAndServe(mmBot.httpAddr, nil); err != nil {
+		panic(err)
 	}
-
-	_, _, err = client.CreatePost(context.TODO(), &post)
-	if err != nil {
-		fmt.Println("Failed to create post:", err)
-	}
-
-	fmt.Println("Post created!")
-	os.Exit(0)
 }
